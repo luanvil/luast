@@ -39,7 +39,20 @@ local TARGET_MAP = {
 }
 
 local LUA_VERSION = os.getenv("LUA_VERSION") or "5.4.8"
+local IS_LUAJIT = LUA_VERSION:lower():match("^jit") or LUA_VERSION:lower():match("^luajit")
+local LUAJIT_VERSION = "2.1"
+local LUAJIT_URL = "https://github.com/LuaJIT/LuaJIT.git"
+local LUAJIT_BRANCH = "v2.1"
 local LUA_URL = "https://www.lua.org/ftp/lua-" .. LUA_VERSION .. ".tar.gz"
+
+local LUAJIT_TARGET_SYS = {
+  ["x86_64-linux-musl"] = "Linux",
+  ["aarch64-linux-musl"] = "Linux",
+  ["x86_64-macos"] = "Darwin",
+  ["aarch64-macos"] = "Darwin",
+  ["x86_64-windows-gnu"] = "Windows",
+  ["aarch64-windows-gnu"] = "Windows",
+}
 
 local LUA_CORE_FILES = {
   "lapi.c",
@@ -432,6 +445,101 @@ local function ensure_lua_source()
   execute(string.format('rm "%s"', archive))
   log("success", "lua source ready")
   return lua_dir
+end
+
+local function ensure_luajit_source()
+  local luajit_dir = CACHE_DIR .. "/luajit-" .. LUAJIT_VERSION
+
+  if dir_exists(luajit_dir .. "/src") then return luajit_dir end
+
+  log("info", "cloning luajit " .. LUAJIT_VERSION)
+  mkdir(CACHE_DIR)
+
+  local cmd = string.format('git clone --depth 1 --branch %s "%s" "%s"', LUAJIT_BRANCH, LUAJIT_URL, luajit_dir)
+  if not execute(cmd) then
+    log("error", "failed to clone luajit")
+    os.exit(1)
+  end
+
+  log("success", "luajit source ready")
+  return luajit_dir
+end
+
+local function check_luajit_requirements()
+  if not execute("which make >/dev/null 2>&1") then
+    log("error", "LuaJIT requires 'make' - please install GNU Make")
+    os.exit(1)
+  end
+  local has_gcc = execute("which gcc >/dev/null 2>&1")
+  local has_clang = execute("which clang >/dev/null 2>&1")
+  if not has_gcc and not has_clang then
+    log("error", "LuaJIT requires 'gcc' or 'clang' for host compilation")
+    os.exit(1)
+  end
+  return has_gcc and "gcc" or "clang"
+end
+
+local function build_luajit_for_target(zig_bin, zig_target)
+  local luajit_src = ensure_luajit_source()
+  local target_build_dir = CACHE_DIR .. "/luajit-" .. cache_key("luajit", LUAJIT_VERSION, zig_target)
+  local libluajit_a = target_build_dir .. "/libluajit.a"
+
+  if file_exists(libluajit_a) then
+    log("success", "libluajit.a for " .. zig_target .. " exists, skipping")
+    return target_build_dir, libluajit_a
+  end
+
+  log("info", "building luajit for " .. zig_target)
+  local host_cc = check_luajit_requirements()
+
+  mkdir(target_build_dir)
+  execute(string.format('cp -r "%s/"* "%s/"', luajit_src, target_build_dir))
+
+  local target_sys = LUAJIT_TARGET_SYS[zig_target] or "Linux"
+  local zig_cc = string.format('"%s" cc -target %s', zig_bin, zig_target)
+
+  -- musl lacks libunwind symbols required by LuaJIT's default DWARF unwinding
+  local xcflags = ""
+  if zig_target:match("musl") then xcflags = "XCFLAGS+=-DLUAJIT_NO_UNWIND" end
+
+  local make_cmd = string.format(
+    'cd "%s" && make clean && make amalg -j4 '
+      .. 'HOST_CC="%s" '
+      .. "STATIC_CC='%s' "
+      .. "DYNAMIC_CC='%s -fPIC' "
+      .. "TARGET_LD='%s' "
+      .. "TARGET_AR='\"%s\" ar rcus' "
+      .. "TARGET_SYS=%s "
+      .. "BUILDMODE=static "
+      .. "%s "
+      .. "Q=",
+    target_build_dir,
+    host_cc,
+    zig_cc,
+    zig_cc,
+    zig_cc,
+    zig_bin,
+    target_sys,
+    xcflags
+  )
+
+  if not execute(make_cmd) then
+    log("error", "failed to build luajit for " .. zig_target)
+    log("info", "command: " .. make_cmd)
+    os.exit(1)
+  end
+
+  local src_lib = target_build_dir .. "/src/libluajit.a"
+  if not file_exists(src_lib) then
+    log("error", "libluajit.a not found after build")
+    os.exit(1)
+  end
+
+  execute(string.format('cp "%s" "%s"', src_lib, libluajit_a))
+  execute(string.format('cp "%s/src/"*.h "%s/"', target_build_dir, target_build_dir))
+
+  log("success", "built libluajit.a for " .. zig_target)
+  return target_build_dir, libluajit_a
 end
 
 local compile_script_counter = 0
@@ -1130,10 +1238,16 @@ end
 
 local function build_for_target(spec, output_name, target)
   local zig_target = TARGET_MAP[target]
-  log("info", "cross-compiling for " .. target .. " (" .. zig_target .. ")")
+  local runtime_name = IS_LUAJIT and "luajit" or "lua"
+  log("info", "cross-compiling for " .. target .. " (" .. zig_target .. ") with " .. runtime_name)
 
   local zig_bin = ensure_zig()
-  local lua_incdir, lua_static_lib = build_lua_for_target(zig_bin, zig_target)
+  local lua_incdir, lua_static_lib
+  if IS_LUAJIT then
+    lua_incdir, lua_static_lib = build_luajit_for_target(zig_bin, zig_target)
+  else
+    lua_incdir, lua_static_lib = build_lua_for_target(zig_bin, zig_target)
+  end
 
   local module_library_files = {}
   for _, dep in ipairs(spec.c_deps) do
@@ -1211,16 +1325,26 @@ local function build_for_target(spec, output_name, target)
 end
 
 local function build_targets_parallel(spec, output_name, targets)
-  log("info", "building " .. #targets .. " targets in parallel")
+  local runtime_name = IS_LUAJIT and "luajit" or "lua"
+  log("info", "building " .. #targets .. " targets in parallel with " .. runtime_name)
 
   local zig_bin = ensure_zig()
-  ensure_lua_source()
+  if IS_LUAJIT then
+    ensure_luajit_source()
+  else
+    ensure_lua_source()
+  end
 
   fetch_clibs_parallel(spec.c_deps)
 
   for _, target in ipairs(targets) do
     local zig_target = TARGET_MAP[target]
-    local lua_incdir = build_lua_for_target(zig_bin, zig_target)
+    local lua_incdir
+    if IS_LUAJIT then
+      lua_incdir = build_luajit_for_target(zig_bin, zig_target)
+    else
+      lua_incdir = build_lua_for_target(zig_bin, zig_target)
+    end
     for _, dep in ipairs(spec.c_deps) do
       build_clib_for_target(zig_bin, zig_target, lua_incdir, dep)
     end

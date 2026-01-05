@@ -174,8 +174,17 @@ Zig is downloaded automatically.
 
 - Linux binaries use musl (not glibc)
 - No automatic LuaRocks dependency resolution
-- No LuaJIT support
 - No OpenSSL/TLS support
+
+## LuaJIT Support
+
+Build with LuaJIT instead of Lua 5.4:
+
+```bash
+LUA_VERSION=jit luast myapp
+```
+
+Requires `make` and `gcc`/`clang` on the host for LuaJIT's bootstrap process.
 
 ## Development
 
