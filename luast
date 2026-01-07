@@ -177,6 +177,7 @@ local CLIB_REGISTRY = {
             { path = "src/url.lua", modname = "socket.url" },
             { path = "src/headers.lua", modname = "socket.headers" },
         },
+        requires_clibs = { "mime" },
     },
     socket = "luasocket",
     ["socket.core"] = "luasocket",
@@ -242,7 +243,7 @@ local function load_luastrc()
     if not f then return end
     f:close()
 
-    local chunk, _err = loadfile(path, "t", {})
+    local chunk, _ = loadfile(path, "t", {})
     if not chunk then return end
 
     local ok, result = pcall(chunk)
@@ -387,37 +388,6 @@ local function download_file(url, dest)
     return execute(string.format('curl -fsSL "%s" -o "%s" || wget -q "%s" -O "%s"', url, dest, url, dest))
 end
 
-local function check_system_deps(spec)
-    local missing = {}
-
-    if not execute("which git >/dev/null 2>&1") then table.insert(missing, "git") end
-    if not execute("which tar >/dev/null 2>&1") then table.insert(missing, "tar") end
-    if not execute("which curl >/dev/null 2>&1 || which wget >/dev/null 2>&1") then
-        table.insert(missing, "curl or wget")
-    end
-
-    if IS_LUAJIT then
-        if not execute("which make >/dev/null 2>&1") then table.insert(missing, "make (required for LuaJIT)") end
-        local has_gcc = execute("which gcc >/dev/null 2>&1")
-        local has_clang = execute("which clang >/dev/null 2>&1")
-        if not has_gcc and not has_clang then table.insert(missing, "gcc or clang (required for LuaJIT)") end
-    end
-
-    if #missing > 0 then
-        log("error", "missing required tools: " .. table.concat(missing, ", "))
-        os.exit(1)
-    end
-end
-
-local function cache_key(...)
-    local str = table.concat({ ... }, "|")
-    local hash = 5381
-    for i = 1, #str do
-        hash = ((hash * 33) + str:byte(i)) % 0x100000000
-    end
-    return string.format("%08x", hash)
-end
-
 local function setup_colors()
     local force = os.getenv("FORCE_COLOR")
     local no_color = os.getenv("NO_COLOR")
@@ -455,6 +425,37 @@ local function log(level, msg)
     else
         io.write(out)
     end
+end
+
+local function check_system_deps()
+    local missing = {}
+
+    if not execute("which git >/dev/null 2>&1") then table.insert(missing, "git") end
+    if not execute("which tar >/dev/null 2>&1") then table.insert(missing, "tar") end
+    if not execute("which curl >/dev/null 2>&1 || which wget >/dev/null 2>&1") then
+        table.insert(missing, "curl or wget")
+    end
+
+    if IS_LUAJIT then
+        if not execute("which make >/dev/null 2>&1") then table.insert(missing, "make (required for LuaJIT)") end
+        local has_gcc = execute("which gcc >/dev/null 2>&1")
+        local has_clang = execute("which clang >/dev/null 2>&1")
+        if not has_gcc and not has_clang then table.insert(missing, "gcc or clang (required for LuaJIT)") end
+    end
+
+    if #missing > 0 then
+        log("error", "missing required tools: " .. table.concat(missing, ", "))
+        os.exit(1)
+    end
+end
+
+local function cache_key(...)
+    local str = table.concat({ ... }, "|")
+    local hash = 5381
+    for i = 1, #str do
+        hash = ((hash * 33) + str:byte(i)) % 0x100000000
+    end
+    return string.format("%08x", hash)
 end
 
 -- luarocks --
@@ -1422,7 +1423,7 @@ local function generate_c_source(lua_source_files, module_library_files, embed_f
         if prefix then
             if prefix:match("\xef\xbb\xbf") then prefix = prefix:sub(4) end
             if prefix:match("#") then
-                f:read("*line")
+                local _ = f:read("*line")
                 prefix = "\n"
             end
             out(string_to_c_hex_literal(prefix), ", ")
@@ -1829,7 +1830,7 @@ local function main(args)
         os.exit(1)
     end
 
-    check_system_deps(spec)
+    check_system_deps()
 
     local targets = opts.targets
     if #targets == 0 then targets = { get_native_target() } end
@@ -1851,7 +1852,25 @@ local function main(args)
         local extra_libs = {}
         local seen_ssl = false
 
+        local expanded_deps = {}
+        local seen_deps = {}
         for _, dep in ipairs(spec.c_deps) do
+            if not seen_deps[dep] then
+                seen_deps[dep] = true
+                table.insert(expanded_deps, dep)
+                local info = resolve_clib(dep)
+                if info and info.requires_clibs then
+                    for _, req in ipairs(info.requires_clibs) do
+                        if not seen_deps[req] then
+                            seen_deps[req] = true
+                            table.insert(expanded_deps, req)
+                        end
+                    end
+                end
+            end
+        end
+
+        for _, dep in ipairs(expanded_deps) do
             local lib_a, info = build_clib_for_target(zig_bin, zig_target, lua_incdir, dep)
             if lib_a and info then
                 local src_dir = fetch_clib_source(info)
