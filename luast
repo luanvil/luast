@@ -828,6 +828,147 @@ local function ensure_luajit_source()
     return luajit_dir
 end
 
+local native_lua_bin = nil
+
+local function get_host_target()
+    local uname = io.popen("uname -s"):read("*l") or "Linux"
+    local arch = io.popen("uname -m"):read("*l") or "x86_64"
+
+    if uname == "Darwin" then return arch == "arm64" and "aarch64-macos" or "x86_64-macos" end
+
+    return arch == "aarch64" and "aarch64-linux-musl" or "x86_64-linux-musl"
+end
+
+local function build_native_lua()
+    local host_target = get_host_target()
+
+    if IS_LUAJIT then
+        local luajit_src = ensure_luajit_source()
+        local build_dir = CACHE_DIR .. "/luajit-native-" .. cache_key("luajit", LUAJIT_VERSION, host_target)
+        local bin_path = build_dir .. "/luajit"
+
+        if file_exists(bin_path) then
+            log("success", "native luajit exists, skipping")
+            return bin_path
+        end
+
+        log("info", "building native luajit for bytecode compilation")
+        mkdir(build_dir)
+        execute(string.format('cp -r "%s/"* "%s/"', luajit_src, build_dir))
+
+        local host_cc = execute("which gcc >/dev/null 2>&1") and "gcc" or "clang"
+        local make_cmd = string.format('cd "%s" && make clean && make -j4 HOST_CC="%s" Q=', build_dir, host_cc)
+
+        if not execute(make_cmd) then
+            log("warn", "failed to build native luajit, falling back to source")
+            return nil
+        end
+
+        local src_bin = build_dir .. "/src/luajit"
+        if file_exists(src_bin) then
+            execute(string.format('cp "%s" "%s"', src_bin, bin_path))
+            log("success", "built native luajit")
+            return bin_path
+        end
+
+        return nil
+    end
+
+    local lua_src = ensure_lua_source()
+    local build_dir = CACHE_DIR .. "/lua-native-" .. cache_key("lua", LUA_VERSION, host_target)
+    local bin_path = build_dir .. "/lua"
+
+    if file_exists(bin_path) then
+        log("success", "native lua exists, skipping")
+        return bin_path
+    end
+
+    log("info", "building native lua for bytecode compilation")
+    mkdir(build_dir)
+    execute(string.format('cp -r "%s/src/"*.c "%s/src/"*.h "%s/"', lua_src, lua_src, build_dir))
+
+    local uname = io.popen("uname -s"):read("*l") or "Linux"
+    local cc = "cc"
+    local defines = "-DLUA_USE_POSIX -DLUA_USE_DLOPEN"
+    local libs = "-lm -ldl"
+
+    if uname == "Darwin" then
+        defines = "-DLUA_USE_MACOSX"
+        libs = "-lm"
+    end
+
+    local objects = {}
+    for _, src in ipairs(LUA_CORE_FILES) do
+        local obj = build_dir .. "/" .. src:gsub("%.c$", ".o")
+        local cmd = string.format('%s -c -O2 %s "%s/%s" -o "%s"', cc, defines, build_dir, src, obj)
+        if not execute(cmd) then
+            log("warn", "failed to compile " .. src)
+            return nil
+        end
+        table.insert(objects, obj)
+    end
+
+    local lua_main_obj = build_dir .. "/lua.o"
+    local cmd = string.format('%s -c -O2 %s "%s/lua.c" -o "%s"', cc, defines, build_dir, lua_main_obj)
+    if not execute(cmd) then
+        log("warn", "failed to compile lua.c")
+        return nil
+    end
+    table.insert(objects, lua_main_obj)
+
+    cmd = string.format('%s -o "%s" %s %s', cc, bin_path, table.concat(objects, " "), libs)
+    if not execute(cmd) then
+        log("warn", "failed to link native lua")
+        return nil
+    end
+
+    log("success", "built native lua")
+    return bin_path
+end
+
+local function compile_to_bytecode(lua_bin, content)
+    local temp_src = os.tmpname() .. ".lua"
+    local temp_out = os.tmpname() .. ".luac"
+
+    local f = io.open(temp_src, "wb")
+    if not f then return nil end
+    f:write(content)
+    f:close()
+
+    local compile_script = string.format(
+        [[
+        local f, err = loadfile(%q)
+        if not f then
+            io.stderr:write(err or "load error")
+            os.exit(1)
+        end
+        local bytecode = string.dump(f, true)
+        local out = io.open(%q, "wb")
+        out:write(bytecode)
+        out:close()
+    ]],
+        temp_src,
+        temp_out
+    )
+
+    local cmd = string.format('"%s" -e %q 2>/dev/null', lua_bin, compile_script)
+    local ok = execute(cmd)
+    os.remove(temp_src)
+
+    if not ok then
+        os.remove(temp_out)
+        return nil
+    end
+
+    local out_f = io.open(temp_out, "rb")
+    if not out_f then return nil end
+    local bytecode = out_f:read("*a")
+    out_f:close()
+    os.remove(temp_out)
+
+    return bytecode
+end
+
 local function compile_parallel(commands)
     if #commands == 0 then return true end
     if #commands == 1 then return execute(commands[1]) end
@@ -1568,15 +1709,20 @@ return status ? 1 : 0;
     )
 end
 
-local function read_file_hex(path)
+local function read_file_hex(path, lua_bin)
     local f = io.open(path, "rb")
     if not f then return nil end
     local content = f:read("*a")
     f:close()
 
     content = content:gsub("^#![^\n]*\n", "")
-
     content = content:gsub("^\xef\xbb\xbf", "")
+
+    if lua_bin then
+        local bytecode = compile_to_bytecode(lua_bin, content)
+        if bytecode then return hexdump(bytecode) end
+    end
+
     return hexdump(content)
 end
 
@@ -1595,11 +1741,11 @@ local function make_source_info(path, base, modname)
     return info
 end
 
-local function prepare_lua_files(spec)
+local function prepare_lua_files(spec, lua_bin)
     local files = {}
 
     local main_info = make_source_info(spec.bin)
-    main_info.hexdata = read_file_hex(spec.bin)
+    main_info.hexdata = read_file_hex(spec.bin, lua_bin)
     if not main_info.hexdata then
         log("error", "cannot read main file: " .. spec.bin)
         os.exit(1)
@@ -1613,7 +1759,7 @@ local function prepare_lua_files(spec)
         else
             info = make_source_info(f)
         end
-        info.hexdata = read_file_hex(info.path)
+        info.hexdata = read_file_hex(info.path, lua_bin)
         if info.hexdata then
             table.insert(files, info)
         else
@@ -1993,12 +2139,18 @@ local function main(args)
     local targets = opts.targets
     if #targets == 0 then targets = { get_native_target() } end
 
+    local zig_bin = ensure_zig()
+    native_lua_bin = build_native_lua()
+    if native_lua_bin then log("info", "using bytecode compilation") end
+
+    local lua_files = prepare_lua_files(spec, native_lua_bin)
+    log("info", "prepared " .. #lua_files .. " lua modules")
+
     for _, target in ipairs(targets) do
         local zig_target = TARGET_MAP[target]
         local runtime_name = IS_LUAJIT and "luajit" or "lua"
         log("info", "building for " .. target .. " (" .. zig_target .. ") with " .. runtime_name)
 
-        local zig_bin = ensure_zig()
         local lua_incdir, lua_static_lib
         if IS_LUAJIT then
             lua_incdir, lua_static_lib = build_luajit_for_target(zig_bin, zig_target)
@@ -2100,7 +2252,6 @@ local function main(args)
             end
         end
 
-        local lua_files = prepare_lua_files(spec)
         local main_modname = lua_files[1].modname
         log("info", "generating C source with " .. #lua_files .. " lua modules")
 
