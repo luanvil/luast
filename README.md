@@ -91,8 +91,7 @@ Options:
 |----------|-------------|---------|
 | `BUILD_DIR` | Build directory | `.build` |
 | `LUAST_CACHE` | Cache directory | `~/.cache/luast` |
-| `LUA_VERSION` | Lua version (`5.4.8` or `jit`) | `5.4.8` |
-| `LUAST_SQLITE_VEC` | Enable sqlite-vec in lsqlite3 (`1` to enable) | - |
+| `LUA_VERSION` | Lua version | `5.4.8` |
 
 ## Standalone Mode
 
@@ -146,11 +145,10 @@ Built-in support:
 | luafilesystem | File system operations |
 | lpeg | Parsing expression grammars |
 | lua-cjson | JSON encoding/decoding |
-| lsqlite3complete | SQLite3 database (includes sqlite3.c). Set `LUAST_SQLITE_VEC=1` to include [sqlite-vec](https://github.com/vlasky/sqlite-vec) for vector search. |
+| lsqlite3complete | SQLite3 database (includes sqlite3.c) |
 | luasocket | TCP/UDP sockets, HTTP client |
 | luasec | SSL/TLS for luasocket (OpenSSL statically linked) |
 | luaossl | OpenSSL bindings (OpenSSL statically linked) |
-| bcrypt | Password hashing with bcrypt |
 
 OpenSSL is cross-compiled and statically linked with optimized settings: legacy ciphers (RC4, IDEA, Blowfish, etc.), regional algorithms (SM2/3/4, GOST, Camellia, SEED), and unused features (compression, engines) are disabled. TLS 1.0-1.3, DTLS, and all modern ciphers (AES, ChaCha20) remain fully supported.
 

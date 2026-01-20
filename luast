@@ -132,55 +132,15 @@ local CLIB_REGISTRY = {
         luaopen = "cjson",
     },
     cjson = "lua-cjson",
-    lsqlite3complete = (function()
-        local info = {
-            name = "lsqlite3",
-            url = "http://lua.sqlite.org/home/zip/lsqlite3_v096.zip?uuid=v0.9.6",
-            type = "zip",
-            sources = { "lsqlite3.c", "sqlite3.c" },
-            luaopen = "lsqlite3",
-            modname = "lsqlite3complete",
-            defines = { 'LSQLITE_VERSION=\\"0.9.6\\"' },
-        }
-
-        if os.getenv("LUAST_SQLITE_VEC") == "1" then
-            info.extra_sources = {
-                {
-                    url = "https://github.com/vlasky/sqlite-vec.git",
-                    type = "git",
-                    tag = "v0.2.4-alpha",
-                    files = { "sqlite-vec.c", "sqlite-vec.h" },
-                },
-            }
-            table.insert(info.defines, "SQLITE_CORE")
-            table.insert(info.defines, "SQLITE_VEC_STATIC")
-
-            table.insert(info.defines, "SQLITE_INNOCUOUS=0")
-            table.insert(info.defines, "SQLITE_SUBTYPE=0x000100000")
-            table.insert(info.defines, "SQLITE_RESULT_SUBTYPE=0x001000000")
-
-            info.preprocess = function(src_dir)
-                local path = src_dir .. "/lsqlite3.c"
-                local f = io.open(path, "r")
-                if not f then return end
-                local content = f:read("*a")
-                f:close()
-                if content:match("sqlite3_vec_init") then return end
-                content = content:gsub(
-                    "LUALIB_API int luaopen_lsqlite3%(lua_State %*L%) {",
-                    "LUALIB_API int luaopen_lsqlite3(lua_State *L) {\n"
-                        .. "    extern int sqlite3_vec_init(sqlite3*, char**, const sqlite3_api_routines*);\n"
-                        .. "    sqlite3_auto_extension((void(*)(void))sqlite3_vec_init);\n"
-                )
-                f = io.open(path, "w")
-                if f then
-                    f:write(content)
-                    f:close()
-                end
-            end
-        end
-        return info
-    end)(),
+    lsqlite3complete = {
+        name = "lsqlite3",
+        url = "http://lua.sqlite.org/home/zip/lsqlite3_v096.zip?uuid=v0.9.6",
+        type = "zip",
+        sources = { "lsqlite3.c", "sqlite3.c" },
+        luaopen = "lsqlite3",
+        modname = "lsqlite3complete",
+        defines = { 'LSQLITE_VERSION=\\"0.9.6\\"' },
+    },
     lsqlite3 = "lsqlite3complete",
     luasocket = {
         name = "socket",
@@ -871,7 +831,12 @@ end
 local native_lua_bin = nil
 
 local function get_host_target()
-    return TARGET_MAP[get_native_target()]
+    local uname = io.popen("uname -s"):read("*l") or "Linux"
+    local arch = io.popen("uname -m"):read("*l") or "x86_64"
+
+    if uname == "Darwin" then return arch == "arm64" and "aarch64-macos" or "x86_64-macos" end
+
+    return arch == "aarch64" and "aarch64-linux-musl" or "x86_64-linux-musl"
 end
 
 local function build_native_lua()
@@ -1272,123 +1237,60 @@ end
 
 local function fetch_clib_source(info)
     local src_dir = BUILD_DIR .. "/" .. info.name
-    local already_fetched = dir_exists(src_dir)
+    if dir_exists(src_dir) then return src_dir end
 
-    if not already_fetched then
-        log("info", "fetching " .. info.name)
+    log("info", "fetching " .. info.name)
 
-        if info.type == "git" then
-            if not execute("git clone --quiet --depth 1 " .. info.url .. " " .. src_dir) then
-                log("error", "failed to clone " .. info.name)
-                os.exit(1)
-            end
-        elseif info.type == "tarball" then
-            local archive = BUILD_DIR .. "/" .. info.name .. ".tar.gz"
-            if not download_file(info.url, archive) then
-                log("error", "failed to download " .. info.name)
-                os.exit(1)
-            end
-            mkdir(src_dir)
-            if not execute(string.format('tar -xzf "%s" -C "%s" --strip-components=1', archive, src_dir)) then
-                log("error", "failed to extract " .. info.name)
-                os.exit(1)
-            end
-            execute(string.format('rm "%s"', archive))
-        elseif info.type == "zip" then
-            local archive = BUILD_DIR .. "/" .. info.name .. ".zip"
-            if not download_file(info.url, archive) then
-                log("error", "failed to download " .. info.name)
-                os.exit(1)
-            end
-            mkdir(src_dir)
-            local tmp_dir = BUILD_DIR .. "/" .. info.name .. "_tmp"
-            mkdir(tmp_dir)
-            if
-                not execute(
-                    string.format(
-                        'unzip -q "%s" -d "%s" && mv "%s"/*/* "%s"/ 2>/dev/null || mv "%s"/* "%s"/',
-                        archive,
-                        tmp_dir,
-                        tmp_dir,
-                        src_dir,
-                        tmp_dir,
-                        src_dir
-                    )
-                )
-            then
-                log("error", "failed to extract " .. info.name)
-                os.exit(1)
-            end
-            execute(string.format('rm -rf "%s" "%s"', tmp_dir, archive))
-        elseif info.type == "local" then
-            mkdir(src_dir)
-            for _, source in ipairs(info.sources) do
-                local dst_file = src_dir .. "/" .. source:match("([^/]+)$")
-                if not execute(string.format('cp "%s" "%s"', source, dst_file)) then
-                    log("error", "failed to copy " .. source)
-                    os.exit(1)
-                end
-            end
+    if info.type == "git" then
+        if not execute("git clone --quiet --depth 1 " .. info.url .. " " .. src_dir) then
+            log("error", "failed to clone " .. info.name)
+            os.exit(1)
         end
-    end
-
-    if info.extra_sources then
-        for _, extra in ipairs(info.extra_sources) do
-            local all_exist = true
-            for _, file in ipairs(extra.files or {}) do
-                local dst_file = src_dir .. "/" .. file:match("([^/]+)$")
-                if not file_exists(dst_file) then
-                    all_exist = false
-                    break
-                end
-            end
-
-            if not all_exist then
-                log("info", "fetching extra source for " .. info.name)
-                local extra_dir = src_dir .. "/_extra_" .. (extra.name or "src")
-                mkdir(extra_dir)
-                if extra.type == "tarball" then
-                    local archive = extra_dir .. "/archive.tar.gz"
-                    if not download_file(extra.url, archive) then
-                        log("error", "failed to download extra source: " .. extra.url)
-                        os.exit(1)
-                    end
-                    if not execute(string.format('tar -xzf "%s" -C "%s" --strip-components=1', archive, extra_dir)) then
-                        log("error", "failed to extract extra source")
-                        os.exit(1)
-                    end
-                    execute(string.format('rm "%s"', archive))
-                elseif extra.type == "git" then
-                    local tag_opt = extra.tag and (" --branch " .. extra.tag) or ""
-                    if
-                        not execute("git clone --quiet --depth 1" .. tag_opt .. " " .. extra.url .. " " .. extra_dir)
-                    then
-                        log("error", "failed to clone extra source: " .. extra.url)
-                        os.exit(1)
-                    end
-                end
-
-                for _, file in ipairs(extra.files or {}) do
-                    local src_file = extra_dir .. "/" .. file
-                    local dst_file = src_dir .. "/" .. file:match("([^/]+)$")
-                    if file_exists(src_file) then execute(string.format('cp "%s" "%s"', src_file, dst_file)) end
-                end
-                execute(string.format('rm -rf "%s"', extra_dir))
-            end
-
-            for _, file in ipairs(extra.files or {}) do
-                local fname = file:match("([^/]+)$")
-
-                if fname:match("%.c$") then
-                    local found = false
-                    for _, s in ipairs(info.sources) do
-                        if s == fname or s:match("([^/]+)$") == fname then
-                            found = true
-                            break
-                        end
-                    end
-                    if not found then table.insert(info.sources, fname) end
-                end
+    elseif info.type == "tarball" then
+        local archive = BUILD_DIR .. "/" .. info.name .. ".tar.gz"
+        if not download_file(info.url, archive) then
+            log("error", "failed to download " .. info.name)
+            os.exit(1)
+        end
+        mkdir(src_dir)
+        if not execute(string.format('tar -xzf "%s" -C "%s" --strip-components=1', archive, src_dir)) then
+            log("error", "failed to extract " .. info.name)
+            os.exit(1)
+        end
+        execute(string.format('rm "%s"', archive))
+    elseif info.type == "zip" then
+        local archive = BUILD_DIR .. "/" .. info.name .. ".zip"
+        if not download_file(info.url, archive) then
+            log("error", "failed to download " .. info.name)
+            os.exit(1)
+        end
+        mkdir(src_dir)
+        local tmp_dir = BUILD_DIR .. "/" .. info.name .. "_tmp"
+        mkdir(tmp_dir)
+        if
+            not execute(
+                string.format(
+                    'unzip -q "%s" -d "%s" && mv "%s"/*/* "%s"/ 2>/dev/null || mv "%s"/* "%s"/',
+                    archive,
+                    tmp_dir,
+                    tmp_dir,
+                    src_dir,
+                    tmp_dir,
+                    src_dir
+                )
+            )
+        then
+            log("error", "failed to extract " .. info.name)
+            os.exit(1)
+        end
+        execute(string.format('rm -rf "%s" "%s"', tmp_dir, archive))
+    elseif info.type == "local" then
+        mkdir(src_dir)
+        for _, source in ipairs(info.sources) do
+            local dst_file = src_dir .. "/" .. source:match("([^/]+)$")
+            if not execute(string.format('cp "%s" "%s"', source, dst_file)) then
+                log("error", "failed to copy " .. source)
+                os.exit(1)
             end
         end
     end
@@ -1422,11 +1324,7 @@ local function build_clib_for_target(zig_bin, zig_target, lua_incdir, clib_name)
     end
 
     local lua_runtime = IS_LUAJIT and "luajit" or "lua54"
-
-    local cache_parts = { info.url or table.concat(info.sources, ",") }
-    if info.defines then table.insert(cache_parts, table.concat(info.defines, ",")) end
-    if info.extra_sources then table.insert(cache_parts, "extra") end
-    local cache_id = table.concat(cache_parts, "|")
+    local cache_id = info.url or table.concat(info.sources, ",")
     local target_build_dir = CACHE_DIR
         .. "/"
         .. info.name
